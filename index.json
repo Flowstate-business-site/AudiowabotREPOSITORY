@@ -1,0 +1,272 @@
+import express from "express";
+import fetch from "node-fetch";
+import axios from "axios";
+import FormData from "form-data";
+import bodyParser from "body-parser";
+
+const app = express();
+app.use(bodyParser.json());
+
+/**
+ * Required ENV vars:
+ * OPENAI_API_KEY, WHATSAPP_TOKEN, WHATSAPP_PHONE_NUMBER_ID, VERIFY_TOKEN
+ */
+const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || "mywhatsapptest123";
+
+if (!OPENAI_KEY) {
+  console.error("Missing OPENAI_API_KEY env var");
+}
+if (!WHATSAPP_TOKEN) {
+  console.error("Missing WHATSAPP_TOKEN env var");
+}
+if (!WHATSAPP_PHONE_NUMBER_ID) {
+  console.error("Missing WHATSAPP_PHONE_NUMBER_ID env var");
+}
+
+// In-memory user sessions: phone -> {targetLanguage: "English"}
+const sessions = new Map();
+
+// helper: send text message via WhatsApp Cloud API
+async function sendWhatsAppText(to, text) {
+  const url = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const body = {
+    messaging_product: "whatsapp",
+    to,
+    type: "text",
+    text: { body: text }
+  };
+  await axios.post(url, body, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+  });
+}
+
+// helper: send audio message (base64) via WhatsApp Cloud API
+async function sendWhatsAppAudio(to, audioBuffer, mime = "audio/mpeg") {
+  // WhatsApp Cloud API supports sending audio by upload via media endpoint and then a message referencing media id.
+  // We'll upload media then send it.
+
+  // 1) Upload media
+  const uploadUrl = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/media`;
+  const form = new FormData();
+  form.append("file", audioBuffer, { filename: "speech.mp3", contentType: mime });
+  form.append("messaging_product", "whatsapp");
+
+  const uploadResp = await axios.post(uploadUrl, form, {
+    headers: {
+      Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+      ...form.getHeaders()
+    }
+  });
+
+  const mediaId = uploadResp.data.id;
+  // 2) Send message referencing media id
+  const msgUrl = `https://graph.facebook.com/v17.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+  const payload = {
+    messaging_product: "whatsapp",
+    to,
+    type: "audio",
+    audio: { id: mediaId }
+  };
+  await axios.post(msgUrl, payload, { headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` } });
+}
+
+// helper: download media from WhatsApp (media_id -> Buffer)
+async function downloadWhatsAppMedia(mediaId) {
+  // get media URL
+  const mediaInfoUrl = `https://graph.facebook.com/v17.0/${mediaId}`;
+  const infoResp = await axios.get(mediaInfoUrl, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+  });
+  const mediaUrl = infoResp.data.url;
+  // now download actual bytes (requires same token)
+  const audioResp = await axios.get(mediaUrl, {
+    headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` },
+    responseType: "arraybuffer"
+  });
+  return Buffer.from(audioResp.data);
+}
+
+// helper: transcribe using OpenAI Whisper (send file buffer)
+async function transcribeWithWhisper(buffer) {
+  const url = "https://api.openai.com/v1/audio/transcriptions";
+  const form = new FormData();
+  form.append("file", buffer, { filename: "voice.ogg" });
+  form.append("model", "whisper-1");
+  // auto language detection built-in
+  const resp = await axios.post(url, form, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      ...form.getHeaders()
+    }
+  });
+  return resp.data.text;
+}
+
+// helper: translate text using OpenAI Chat Completion (gpt-4o-mini or similar)
+async function translateWithOpenAI(text, targetLang) {
+  const url = "https://api.openai.com/v1/chat/completions";
+  const prompt = `Translate the following text into ${targetLang}. Return just the translation (no extra commentary):\n\n${text}`;
+  const resp = await axios.post(url, {
+    model: "gpt-4o-mini",
+    messages: [{ role: "user", content: prompt }],
+    max_tokens: 2000
+  }, {
+    headers: { Authorization: `Bearer ${OPENAI_KEY}` }
+  });
+  // return assistant reply
+  const content = resp.data.choices?.[0]?.message?.content;
+  return (content || "").trim();
+}
+
+// helper: text-to-speech using OpenAI TTS endpoint (creates audio bytes)
+async function ttsWithOpenAI(text, voice = "alloy_female") {
+  // NOTE: endpoint and parameters might change. We'll call /v1/audio/speech
+  // Some SDKs expect application/json with model & input; others use multipart.
+  const url = "https://api.openai.com/v1/audio/speech";
+  // payload
+  const payload = {
+    model: "gpt-4o-mini-tts",
+    voice: "alloy",
+    input: text
+  };
+  // The TTS endpoint might return audio bytes directly; we set responseType accordingly.
+  const resp = await axios.post(url, payload, {
+    headers: {
+      Authorization: `Bearer ${OPENAI_KEY}`,
+      "Content-Type": "application/json"
+    },
+    responseType: "arraybuffer"
+  });
+  return Buffer.from(resp.data);
+}
+
+// verify webhook GET (called by Meta)
+app.get("/webhook", (req, res) => {
+  const mode = req.query["hub.mode"];
+  const token = req.query["hub.verify_token"];
+  const challenge = req.query["hub.challenge"];
+  if (mode === "subscribe" && token === VERIFY_TOKEN) {
+    console.log("Webhook verified");
+    res.status(200).send(challenge);
+  } else {
+    res.status(403).send("Verification failed");
+  }
+});
+
+// webhook POST endpoint (incoming messages)
+app.post("/webhook", async (req, res) => {
+  try {
+    const data = req.body;
+    // iterate entries
+    if (!data.entry) return res.sendStatus(200);
+    for (const entry of data.entry) {
+      for (const change of entry.changes || []) {
+        const value = change.value || {};
+        const messages = value.messages || [];
+        for (const msg of messages) {
+          const from = msg.from; // user's phone number
+          // if first time user, ask for target language
+          if (!sessions.has(from)) {
+            sessions.set(from, { targetLanguage: null });
+            await sendWhatsAppText(from, "Hi! 👋 Which language would you like your voice messages translated into? Please reply with the language name in English (e.g., English, Spanish, French).");
+            continue;
+          }
+
+          // process if text (set target language)
+          if (msg.type === "text" && msg.text && msg.text.body) {
+            const body = msg.text.body.trim();
+            // simple command: if user says "English" or "/translate_to English"
+            if (body.toLowerCase().startsWith("/translate_to")) {
+              const parts = body.split(" ");
+              if (parts.length >= 2) {
+                const lang = parts.slice(1).join(" ").trim();
+                sessions.set(from, { targetLanguage: lang });
+                await sendWhatsAppText(from, `Target language set to ${lang} ✅. Now send a voice note and I'll translate it.`);
+              } else {
+                await sendWhatsAppText(from, "Please provide a language. Example: /translate_to English");
+              }
+            } else {
+              // treat plain text reply as the language choice if target not set
+              const session = sessions.get(from);
+              if (!session.targetLanguage) {
+                sessions.set(from, { targetLanguage: body });
+                await sendWhatsAppText(from, `Target language set to ${body} ✅. Now send a voice note and I'll translate it.`);
+              } else {
+                await sendWhatsAppText(from, "I got your message. To change language use: /translate_to <Language>");
+              }
+            }
+            continue;
+          }
+
+          // process audio message
+          if (msg.type === "audio" || msg.type === "voice") {
+            const mediaId = msg.audio?.id || msg.voice?.id || (msg?.audio && msg.audio.id);
+            if (!mediaId) {
+              await sendWhatsAppText(from, "Sorry, I couldn't find the audio. Please resend the voice note.");
+              continue;
+            }
+            await sendWhatsAppText(from, "Got your voice note — processing... ⏳");
+            // download media bytes
+            const audioBuffer = await downloadWhatsAppMedia(mediaId);
+
+            // 1) Transcribe with Whisper
+            let transcript;
+            try {
+              transcript = await transcribeWithWhisper(audioBuffer);
+            } catch (err) {
+              console.error("Transcription error", err?.response?.data || err.message);
+              await sendWhatsAppText(from, "Sorry, I couldn't transcribe your audio.");
+              continue;
+            }
+
+            // 2) get target language
+            const session = sessions.get(from);
+            const targetLang = session?.targetLanguage || "English";
+
+            // 3) Translate using OpenAI chat
+            let translated;
+            try {
+              translated = await translateWithOpenAI(transcript, targetLang);
+            } catch (err) {
+              console.error("Translation error", err?.response?.data || err.message);
+              await sendWhatsAppText(from, "Sorry, I couldn't translate your text.");
+              continue;
+            }
+
+            // 4) TTS: convert translated text to audio (female voice)
+            let ttsBuffer;
+            try {
+              ttsBuffer = await ttsWithOpenAI(translated);
+            } catch (err) {
+              console.error("TTS error", err?.response?.data || err.message);
+              await sendWhatsAppText(from, "Sorry, TTS generation failed.");
+              continue;
+            }
+
+            // 5) Send audio back to user
+            try {
+              await sendWhatsAppAudio(from, ttsBuffer, "audio/mpeg");
+            } catch (err) {
+              console.error("Send audio error", err?.response?.data || err.message);
+              await sendWhatsAppText(from, "Sorry, couldn't send the audio back.");
+            }
+          } // end audio handling
+        } // end messages loop
+      } // end changes loop
+    } // end entry loop
+
+    res.sendStatus(200);
+  } catch (e) {
+    console.error("Webhook handler error:", e);
+    res.sendStatus(500);
+  }
+});
+
+// basic root handler
+app.get("/", (req, res) => res.send("WhatsApp Audio Translator Bot is running"));
+
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log(`Server listening on port ${port}`));
